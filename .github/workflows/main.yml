@@ -1,0 +1,349 @@
+name: V2
+
+on:
+  workflow_dispatch
+
+jobs:
+  rdp-access:
+    runs-on: windows-latest
+    steps:
+      - name: Download Cloudflared
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "$env:USERPROFILE\cloudflared.exe"
+
+      - name: Enable RDP + Disable Lock/Sleep
+        env:
+          RDP_USER: ${{ secrets.USER }}
+          RDP_PASS: ${{ secrets.PASSWORD }}
+        run: |
+          # Validasi secret dulu (jangan lanjut kalau kosong).
+          if ([string]::IsNullOrWhiteSpace($env:RDP_USER)) {
+            throw "Secret 'USER' belum diatur di Settings > Secrets and variables > Actions."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASS)) {
+            throw "Secret 'PASSWORD' belum diatur di Settings > Secrets and variables > Actions."
+          }
+
+          # Aktifkan Remote Desktop.
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          # Nonaktifkan sleep, hibernate, dan timeout monitor agar sesi
+          # tidak pernah terputus saat ditinggal.
+          powercfg /change standby-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+
+          # ---------------------------------------------------------
+          # Logon otomatis.
+          # Password disimpan sebagai LSA secret (terenkripsi) lewat
+          # LsaStorePrivateData - BUKAN nilai DefaultPassword di
+          # registry, yang tersimpan plaintext dan bisa dibaca remote
+          # oleh grup Authenticated Users.
+          # Referensi: Microsoft Learn "Protecting the Automatic
+          # Logon Password".
+          # ---------------------------------------------------------
+          $lsaSrc = @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class LsaAutologon {
+            [StructLayout(LayoutKind.Sequential)]
+            public struct LSA_UNICODE_STRING { public ushort Length; public ushort MaximumLength; public IntPtr Buffer; }
+            [StructLayout(LayoutKind.Sequential)]
+            public struct LSA_OBJECT_ATTRIBUTES { public int Length; public IntPtr RootDirectory; public IntPtr ObjectName; public uint Attributes; public IntPtr SecurityDescriptor; public IntPtr SecurityQualityOfService; }
+            [DllImport("advapi32.dll")]
+            static extern uint LsaOpenPolicy(IntPtr SystemName, ref LSA_OBJECT_ATTRIBUTES ObjectAttributes, uint DesiredAccess, out IntPtr PolicyHandle);
+            [DllImport("advapi32.dll", EntryPoint="LsaStorePrivateData")]
+            static extern uint Store(IntPtr PolicyHandle, ref LSA_UNICODE_STRING KeyName, IntPtr PrivateData);
+            [DllImport("advapi32.dll")]
+            static extern uint LsaNtStatusToWinError(uint Status);
+            [DllImport("advapi32.dll")]
+            static extern uint LsaClose(IntPtr PolicyHandle);
+            static LSA_UNICODE_STRING Us(string s){
+              var u = new LSA_UNICODE_STRING();
+              u.Buffer = Marshal.StringToHGlobalUni(s);
+              u.Length = (ushort)(s.Length * 2);
+              u.MaximumLength = (ushort)((s.Length + 1) * 2);
+              return u;
+            }
+            public static uint Set(string name, string value){
+              var oa = new LSA_OBJECT_ATTRIBUTES();
+              oa.Length = Marshal.SizeOf(typeof(LSA_OBJECT_ATTRIBUTES));
+              IntPtr h;
+              uint st = LsaOpenPolicy(IntPtr.Zero, ref oa, 0x00000020, out h); // POLICY_CREATE_SECRET
+              if (st != 0) return LsaNtStatusToWinError(st);
+              var kn = Us(name);
+              uint r;
+              if (value == null) {
+                r = Store(h, ref kn, IntPtr.Zero);
+              } else {
+                var dv = Us(value);
+                IntPtr ps = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(LSA_UNICODE_STRING)));
+                try {
+                  Marshal.StructureToPtr(dv, ps, false);
+                  r = Store(h, ref kn, ps);
+                } finally {
+                  Marshal.FreeHGlobal(ps);
+                  Marshal.FreeHGlobal(dv.Buffer);
+                }
+              }
+              Marshal.FreeHGlobal(kn.Buffer);
+              LsaClose(h);
+              return LsaNtStatusToWinError(r);
+            }
+          }
+          '@
+          Add-Type -TypeDefinition $lsaSrc -ErrorAction Stop
+
+          $reg = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+          Set-ItemProperty -Path $reg -Name "AutoAdminLogon" -Value "1"
+          Set-ItemProperty -Path $reg -Name "DefaultUserName" -Value $env:RDP_USER
+
+          # Simpan password sebagai LSA secret (terenkripsi).
+          $err = [LsaAutologon]::Set("DefaultPassword", $env:RDP_PASS)
+          if ($err -ne 0) { throw "Gagal menyimpan password ke LSA secret (WinError=$err)." }
+
+          # Hapus kemungkinan sisa DefaultPassword plaintext lama,
+          # supaya tidak ada salinan password terbuka di registry.
+          Remove-ItemProperty -Path $reg -Name "DefaultPassword" -ErrorAction SilentlyContinue
+
+          # Nonaktifkan screen saver dan kunci workstation.
+          New-Item -Path "HKCU:\Software\Policies\Microsoft\Windows\Control Panel\Desktop" -Force | Out-Null
+          Set-ItemProperty -Path "HKCU:\Software\Policies\Microsoft\Windows\Control Panel\Desktop" -Name "ScreenSaveActive" -Value "0"
+
+      - name: Set RDP Credentials
+        env:
+          RDP_USER: ${{ secrets.USER }}
+          RDP_PASS: ${{ secrets.PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_USER))  { throw "Secret 'USER' belum diatur." }
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASS))  { throw "Secret 'PASSWORD' belum diatur." }
+
+          # Nilai diambil dari env, bukan ditulis di kode.
+          $user     = $env:RDP_USER
+          $password = $env:RDP_PASS
+
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name $user -Password $securePassword -ErrorAction Stop
+          } else {
+              Set-LocalUser -Name $user -Password $securePassword -ErrorAction Stop
+          }
+
+          # Tambahkan ke Administrators hanya jika belum ada (hindari error duplikat).
+          $inGroup = Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.Name -like "*\$user" }
+          if (-not $inGroup) { Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction Stop }
+
+          net accounts /maxpwage:unlimited
+          Write-Host "[+] User lokal dibuat/diperbarui dan dimasukkan ke Administrators."
+
+      - name: Save Tunnel Credentials
+        env:
+          TCP_CREDENTIALS: ${{ secrets.TCP_CREDENTIALS }}
+        run: |
+          New-Item -ItemType Directory -Path "$env:USERPROFILE\.cloudflared" -Force
+          $Env:TCP_CREDENTIALS | Out-File "$env:USERPROFILE\.cloudflared\tcp_tunnel.json" -Encoding utf8
+
+      - name: Run Tunnel + RDP Watchdog
+        env:
+          TCP_CREDENTIALS: ${{ secrets.TCP_CREDENTIALS }}
+          RDP_HOSTNAME: ${{ secrets.RDP_HOSTNAME }}
+        run: |
+          $cfExe       = "$env:USERPROFILE\cloudflared.exe"
+          $credFile    = "$env:USERPROFILE\.cloudflared\tcp_tunnel.json"
+          $logFile     = "$env:USERPROFILE\cloudflared.log"
+          $metricsPort = 2000
+
+          # CATATAN: scope $using: tidak valid di dalam Register-ObjectEvent
+          # -Action (hanya berlaku untuk Invoke-Command/Start-Job). Variabel
+          # global dipakai sebagai gantinya agar file log ikut tertulis.
+          $global:CloudflaredLog = $logFile
+
+          function Start-Tunnel {
+            Write-Host "[*] Starting cloudflared..."
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $cfExe
+            $psi.Arguments = "tunnel --no-autoupdate --metrics 127.0.0.1:$metricsPort --credentials-file `"$credFile`" run tcp"
+            $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+            $psi.CreateNoWindow = $true
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $p.BeginOutputReadLine()
+            $p.BeginErrorReadLine()
+            Register-ObjectEvent -InputObject $p -EventName OutputDataReceived -Action {
+              Add-Content -Path $global:CloudflaredLog -Value $Event.SourceEventArgs.Data
+            } | Out-Null
+            Register-ObjectEvent -InputObject $p -EventName ErrorDataReceived -Action {
+              Add-Content -Path $global:CloudflaredLog -Value $Event.SourceEventArgs.Data
+            } | Out-Null
+            return $p
+          }
+
+          # Cek kesehatan tunnel tiga lapis (bukan cuma HTTP 200):
+          #   exited  - proses cloudflared sudah keluar
+          #   nometa  - proses hidup tapi endpoint metrics tidak terbaca
+          #   stuck   - metrics OK tapi 0 koneksi aktif ke edge (retry internal macet)
+          #   ok      - metrics OK dan ada koneksi aktif ke edge
+          #   unknown - nama metrik tidak dikenal (fallback: anggap up, perilaku lama)
+          function Get-TunnelState {
+            if ($null -eq $proc -or $proc.HasExited) { return 'exited' }
+            try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:$metricsPort/metrics" -UseBasicParsing -TimeoutSec 5
+              if ($r.StatusCode -ne 200) { return 'nometa' }
+            } catch { return 'nometa' }
+
+            $found = $false
+            $conn  = -1
+            foreach ($line in ($r.Content -split "`n")) {
+              if ($line -match '^\s*cloudflared_tunnel_ha_connections') {
+                $tok = ($line -split '\s+')[-1]
+                if ($tok -match '^[0-9]') { $conn = [double]$tok; $found = $true }
+                break
+              }
+            }
+            if (-not $found) { return 'unknown' }
+            if ($conn -le 0)  { return 'stuck' }
+            return 'ok'
+          }
+
+          # Probe end-to-end: TCP connect ke hostname publik tunnel:3389.
+          # Melewati rantai DNS -> edge Cloudflare -> tunnel -> cloudflared -> RDP.
+          # Hasil: 'skip' (RDP_HOSTNAME belum diatur) | 'ok' | 'fail'
+          function Test-E2E {
+            if ([string]::IsNullOrWhiteSpace($env:RDP_HOSTNAME)) { return 'skip' }
+            $c = New-Object System.Net.Sockets.TcpClient
+            try {
+              $ar = $c.BeginConnect($env:RDP_HOSTNAME, 3389, $null, $null)
+              if (-not $ar.AsyncWaitHandle.WaitOne(5000, $false)) { return 'fail' }
+              $c.EndConnect($ar)
+              return 'ok'
+            } catch { return 'fail' }
+            finally { $c.Close() }
+          }
+
+          function Test-RDP {
+            try {
+              return Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue -InformationLevel Quiet
+            } catch { return $false }
+          }
+
+          function Ensure-RDP {
+            $svc = Get-Service -Name TermService -ErrorAction SilentlyContinue
+            if ($svc.Status -ne 'Running') {
+              Write-Host "[!] TermService not running, restarting..."
+              Start-Service TermService
+              Start-Sleep 3
+            }
+          }
+
+          Write-Host "===================================="
+          Write-Host "[+] RDP is ready"
+          Write-Host "    Credentials: see the USER and PASSWORD repository secrets."
+          Write-Host "===================================="
+
+          $backoff     = 5
+          $maxBackoff  = 60
+          $stuckGrace  = 90
+          $pollSec     = 5
+          $e2eInterval = 30
+          $lastTunnelUp = $true
+          $lastRdpUp    = $true
+          $downSince    = $null
+          $lastE2e      = $null
+          $e2eWarned    = $false
+          $e2eSkipLogged = $false
+          $proc = Start-Tunnel
+          Start-Sleep -Seconds 8
+
+          while ($true) {
+            $state = Get-TunnelState
+            $rdpOk = Test-RDP
+
+            $tunnelOk = ($state -eq 'ok' -or $state -eq 'unknown')
+
+            # stuck: beri grace period agar reconnect internal cloudflared
+            # (backoff 2-64s) sempat jalan sebelum proses di-kill.
+            # exited/nometa langsung restart seperti perilaku lama.
+            if (-not $tunnelOk) {
+              $restart = $true
+              $reason  = $state
+
+              if ($state -eq 'stuck') {
+                if ($null -eq $downSince) { $downSince = Get-Date }
+                $downFor = [int]((Get-Date) - $downSince).TotalSeconds
+                if ($downFor -lt $stuckGrace) {
+                  $restart = $false
+                  if ($downFor -eq 0 -or ($downFor % 30) -eq 0) {
+                    Write-Host "[!] Tunnel stuck (0 edge connections) - grace ${downFor}/${stuckGrace}s, letting cloudflared self-reconnect..."
+                  }
+                } else {
+                  $reason = "stuck for ${downFor}s"
+                }
+              }
+
+              if ($restart) {
+                $downSince = $null
+                if ($lastTunnelUp) { Write-Host "[!] Tunnel DOWN detected ($reason)" }
+                Write-Host "[!] Restarting in ${backoff}s..."
+                try { if ($proc -and -not $proc.HasExited) { $proc.Kill() } } catch {}
+                Start-Sleep -Seconds 2
+                $proc = Start-Tunnel
+                Start-Sleep -Seconds $backoff
+                $backoff = [Math]::Min($backoff * 2, $maxBackoff)
+              } else {
+                Start-Sleep -Seconds $pollSec
+              }
+              $tunnelOk = $false
+            } else {
+              $downSince = $null
+              if (-not $lastTunnelUp) { Write-Host "[+] Tunnel recovered!" }
+              $backoff = 5
+              Start-Sleep -Seconds $pollSec
+            }
+            $lastTunnelUp = $tunnelOk
+
+            # Port RDP mati, jalankan ulang layanannya.
+            if (-not $rdpOk) {
+              Write-Host "[!] RDP port 3389 not listening, fixing..."
+              if ($lastRdpUp) { Write-Host "[!] RDP service DOWN detected" }
+              Ensure-RDP
+            } else {
+              if (-not $lastRdpUp) { Write-Host "[+] RDP recovered!" }
+            }
+            $lastRdpUp = $rdpOk
+
+            # --- E2E probe (opsional, hanya monitoring - TIDAK PERNAH restart) ---
+            # Gagal di sini + lokal OK = masalah DNS/edge Cloudflare di luar
+            # kendali runner; restart justru merusak koneksi yang bagus.
+            if ($null -eq $lastE2e -or ((Get-Date) - $lastE2e).TotalSeconds -ge $e2eInterval) {
+              $lastE2e = Get-Date
+              $e2e = Test-E2E
+              if ($e2e -eq 'skip') {
+                if (-not $e2eSkipLogged) {
+                  $e2eSkipLogged = $true
+                  Write-Host "[i] Secret RDP_HOSTNAME belum diatur - E2E probe nonaktif."
+                }
+              } else {
+                $e2eOk = ($e2e -eq 'ok')
+                if (-not $tunnelOk) {
+                  $e2eWarned = $false
+                } elseif ($e2eOk) {
+                  if ($e2eWarned) { Write-Host "[+] E2E probe recovered! (user path OK: ${env:RDP_HOSTNAME}:3389)" }
+                  $e2eWarned = $false
+                } elseif (-not $e2eWarned) {
+                  Write-Host "[!] E2E probe FAILED (${env:RDP_HOSTNAME}:3389) - local tunnel OK, likely DNS/edge problem (restart won't help)"
+                  $e2eWarned = $true
+                }
+              }
+            }
+          }
+
+      - name: Cleanup
+        if: always()
+        run: |
+          Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
+          Remove-Item "$env:USERPROFILE\.cloudflared\tcp_tunnel.json" -Force -ErrorAction SilentlyContinue
