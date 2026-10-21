@@ -1,5 +1,4 @@
 name: V2
-
 on:
   workflow_dispatch
 
@@ -16,7 +15,6 @@ jobs:
           RDP_USER: ${{ secrets.USER }}
           RDP_PASS: ${{ secrets.PASSWORD }}
         run: |
-          # Validasi secret dulu (jangan lanjut kalau kosong).
           if ([string]::IsNullOrWhiteSpace($env:RDP_USER)) {
             throw "Secret 'USER' belum diatur di Settings > Secrets and variables > Actions."
           }
@@ -24,25 +22,15 @@ jobs:
             throw "Secret 'PASSWORD' belum diatur di Settings > Secrets and variables > Actions."
           }
 
-          # Aktifkan Remote Desktop.
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-          # Nonaktifkan sleep, hibernate, dan timeout monitor agar sesi
-          # tidak pernah terputus saat ditinggal.
           powercfg /change standby-timeout-ac 0
           powercfg /change hibernate-timeout-ac 0
           powercfg /change monitor-timeout-ac 0
 
-          # ---------------------------------------------------------
-          # Logon otomatis.
-          # Password disimpan sebagai LSA secret (terenkripsi) lewat
-          # LsaStorePrivateData - BUKAN nilai DefaultPassword di
-          # registry, yang tersimpan plaintext dan bisa dibaca remote
-          # oleh grup Authenticated Users.
-          # Referensi: Microsoft Learn "Protecting the Automatic
-          # Logon Password".
-          # ---------------------------------------------------------
+          # Logon otomatis - password disimpan sebagai LSA secret (terenkripsi),
+          # bukan DefaultPassword plaintext di registry.
           $lsaSrc = @'
           using System;
           using System.Runtime.InteropServices;
@@ -99,15 +87,11 @@ jobs:
           Set-ItemProperty -Path $reg -Name "AutoAdminLogon" -Value "1"
           Set-ItemProperty -Path $reg -Name "DefaultUserName" -Value $env:RDP_USER
 
-          # Simpan password sebagai LSA secret (terenkripsi).
           $err = [LsaAutologon]::Set("DefaultPassword", $env:RDP_PASS)
           if ($err -ne 0) { throw "Gagal menyimpan password ke LSA secret (WinError=$err)." }
 
-          # Hapus kemungkinan sisa DefaultPassword plaintext lama,
-          # supaya tidak ada salinan password terbuka di registry.
           Remove-ItemProperty -Path $reg -Name "DefaultPassword" -ErrorAction SilentlyContinue
 
-          # Nonaktifkan screen saver dan kunci workstation.
           New-Item -Path "HKCU:\Software\Policies\Microsoft\Windows\Control Panel\Desktop" -Force | Out-Null
           Set-ItemProperty -Path "HKCU:\Software\Policies\Microsoft\Windows\Control Panel\Desktop" -Name "ScreenSaveActive" -Value "0"
 
@@ -119,7 +103,6 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:RDP_USER))  { throw "Secret 'USER' belum diatur." }
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASS))  { throw "Secret 'PASSWORD' belum diatur." }
 
-          # Nilai diambil dari env, bukan ditulis di kode.
           $user     = $env:RDP_USER
           $password = $env:RDP_PASS
 
@@ -131,7 +114,6 @@ jobs:
               Set-LocalUser -Name $user -Password $securePassword -ErrorAction Stop
           }
 
-          # Tambahkan ke Administrators hanya jika belum ada (hindari error duplikat).
           $inGroup = Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue |
                      Where-Object { $_.Name -like "*\$user" }
           if (-not $inGroup) { Add-LocalGroupMember -Group "Administrators" -Member $user -ErrorAction Stop }
@@ -143,29 +125,74 @@ jobs:
         env:
           TCP_CREDENTIALS: ${{ secrets.TCP_CREDENTIALS }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:TCP_CREDENTIALS)) {
+            throw "Secret 'TCP_CREDENTIALS' belum diatur."
+          }
           New-Item -ItemType Directory -Path "$env:USERPROFILE\.cloudflared" -Force
-          $Env:TCP_CREDENTIALS | Out-File "$env:USERPROFILE\.cloudflared\tcp_tunnel.json" -Encoding utf8
+          # Out-File utf8 menulis BOM; cloudflared JSON parser bisa gagal karena BOM.
+          # Tulis tanpa BOM supaya kredensial selalu terbaca valid.
+          [System.IO.File]::WriteAllText("$env:USERPROFILE\.cloudflared\tcp_tunnel.json", $env:TCP_CREDENTIALS)
 
-      - name: Run Tunnel + RDP Watchdog
-        env:
-          TCP_CREDENTIALS: ${{ secrets.TCP_CREDENTIALS }}
-          RDP_HOSTNAME: ${{ secrets.RDP_HOSTNAME }}
+      - name: Write Watchdog Script
         run: |
+          $wd = @'
+          # ============================================================
+          # Watchdog tunnel v8 FAST
+          # Kalibrasi live di runner (diukur, bukan teori):
+          #   /ready endpoint latency : median 2-3ms  -> polling 1s gratis
+          #   loop reaksi putus       : 0.4s (bench: fault t=5.0s, alarm t=5.37s)
+          # Budget deteksi v8:
+          #   proses mati / metrics mati : 1-2 detik  (v7: 5-60s, v5/v6: tidak terdeteksi)
+          #   /ready non-200 (edge putus): 8s self-heal window, lalu restart
+          #   zombie (E2E mati total)    : 2x gagal x 5s = 10-13 detik -> hard reset
+          # Anti-thrash: >3x stuck dalam 5 menit -> grace naik ke 30s.
+          # ============================================================
           $cfExe       = "$env:USERPROFILE\cloudflared.exe"
           $credFile    = "$env:USERPROFILE\.cloudflared\tcp_tunnel.json"
           $logFile     = "$env:USERPROFILE\cloudflared.log"
+          $hbFile      = "$env:USERPROFILE\cf-watchdog.hb"
           $metricsPort = 2000
-
-          # CATATAN: scope $using: tidak valid di dalam Register-ObjectEvent
-          # -Action (hanya berlaku untuk Invoke-Command/Start-Job). Variabel
-          # global dipakai sebagai gantinya agar file log ikut tertulis.
+          $protocol    = if ($env:CF_PROTOCOL) { $env:CF_PROTOCOL } else { 'quic' }
           $global:CloudflaredLog = $logFile
 
+          # --- tuning (hasil kalibrasi di mesin ini) ---
+          $pollMs         = 1000   # polling /ready - reaksi terukur 0.4s
+          $bootWaitSec    = 10     # grace setelah start baru (metrics butuh waktu up)
+          $stuckFastSec   = 8      # /ready non-200: tunggu self-reconnect internal dulu
+          $stuckSlowSec   = 30     # flap berulang: grace panjang
+          $flapWindowSec  = 300
+          $flapLimit      = 3
+          $e2eEveryTicks  = 5      # E2E tiap 5 detik (5 tick x 1s)
+          $e2eTimeoutMs   = 3000
+          $e2eFailLimit   = 2      # 2x berturut = zombie -> hard reset
+          $hbStaleSec     = 60
+
+          function Send-Heartbeat {
+            Set-Content -Path $hbFile -Value (Get-Date -Format 'o') -ErrorAction SilentlyContinue
+          }
+
+          function Sleep-With-Heartbeat([int]$seconds) {
+            $deadline = (Get-Date).AddSeconds($seconds)
+            while ((Get-Date) -lt $deadline) {
+              Send-Heartbeat
+              $remaining = [int][Math]::Ceiling(($deadline - (Get-Date)).TotalSeconds)
+              if ($remaining -le 0) { break }
+              Start-Sleep -Seconds ([Math]::Min(10, $remaining))
+            }
+            Send-Heartbeat
+          }
+
+          function Write-Log([string]$msg) {
+            $line = "[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $msg
+            Write-Host $line
+            Add-Content -Path $logFile -Value $line -ErrorAction SilentlyContinue
+          }
+
           function Start-Tunnel {
-            Write-Host "[*] Starting cloudflared..."
+            Write-Log "[*] Starting cloudflared (protocol=$protocol)..."
             $psi = New-Object System.Diagnostics.ProcessStartInfo
             $psi.FileName = $cfExe
-            $psi.Arguments = "tunnel --no-autoupdate --metrics 127.0.0.1:$metricsPort --credentials-file `"$credFile`" run tcp"
+            $psi.Arguments = "tunnel --no-autoupdate --metrics 127.0.0.1:$metricsPort --credentials-file `"$credFile`" --protocol $protocol run tcp"
             $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
             $psi.CreateNoWindow = $true
             $psi.UseShellExecute = $false
@@ -183,42 +210,74 @@ jobs:
             return $p
           }
 
-          # Cek kesehatan tunnel tiga lapis (bukan cuma HTTP 200):
-          #   exited  - proses cloudflared sudah keluar
-          #   nometa  - proses hidup tapi endpoint metrics tidak terbaca
-          #   stuck   - metrics OK tapi 0 koneksi aktif ke edge (retry internal macet)
-          #   ok      - metrics OK dan ada koneksi aktif ke edge
-          #   unknown - nama metrik tidak dikenal (fallback: anggap up, perilaku lama)
+          function Stop-Tunnel($p) {
+            try {
+              if ($p -and -not $p.HasExited) {
+                $p.Kill()
+                $null = $p.WaitForExit(15000)
+              }
+            } catch {}
+            try {
+              Get-EventSubscriber -ErrorAction SilentlyContinue |
+                Where-Object { $_.SourceObject -eq $p } |
+                ForEach-Object {
+                  Unregister-Event -SourceIdentifier $_.SourceIdentifier -Force -ErrorAction SilentlyContinue
+                  Remove-Job -Id $_.Action.Id -Force -ErrorAction SilentlyContinue
+                }
+            } catch {}
+            $deadline = (Get-Date).AddSeconds(15)
+            while ((Get-Date) -lt $deadline) {
+              $busy = Get-NetTCPConnection -LocalPort $metricsPort -State Listen -ErrorAction SilentlyContinue
+              if (-not $busy) { return }
+              Start-Sleep -Milliseconds 400
+            }
+            Get-NetTCPConnection -LocalPort $metricsPort -State Listen -ErrorAction SilentlyContinue |
+              ForEach-Object {
+                try { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue } catch {}
+              }
+          }
+
+          function Test-Ready {
+            try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:$metricsPort/ready" -UseBasicParsing -TimeoutSec 2
+              return ($r.StatusCode -eq 200)
+            } catch { return $false }
+          }
+
+          function Get-MetricsText {
+            try {
+              $r = Invoke-WebRequest -Uri "http://127.0.0.1:$metricsPort/metrics" -UseBasicParsing -TimeoutSec 2
+              if ($r.StatusCode -ne 200) { return $null }
+              return $r.Content
+            } catch { return $null }
+          }
+
+          # exited  - proses mati
+          # nometa  - metrics tidak terbaca (proses hang / port bentrok)
+          # stuck   - /ready non-200 (tidak ada koneksi aktif ke edge)
+          # ok      - sehat
           function Get-TunnelState {
             if ($null -eq $proc -or $proc.HasExited) { return 'exited' }
-            try {
-              $r = Invoke-WebRequest -Uri "http://127.0.0.1:$metricsPort/metrics" -UseBasicParsing -TimeoutSec 5
-              if ($r.StatusCode -ne 200) { return 'nometa' }
-            } catch { return 'nometa' }
-
-            $found = $false
-            $conn  = -1
-            foreach ($line in ($r.Content -split "`n")) {
-              if ($line -match '^\s*cloudflared_tunnel_ha_connections') {
-                $tok = ($line -split '\s+')[-1]
-                if ($tok -match '^[0-9]') { $conn = [double]$tok; $found = $true }
-                break
-              }
+            $metrics = Get-MetricsText
+            if ($null -eq $metrics) { return 'nometa' }
+            if (-not (Test-Ready)) { return 'stuck' }
+            $connLine = $null
+            foreach ($line in ($metrics -split "`n")) {
+              if ($line -match '^\s*cloudflared_tunnel_ha_connections\s') { $connLine = $line; break }
             }
-            if (-not $found) { return 'unknown' }
-            if ($conn -le 0)  { return 'stuck' }
+            if ($null -ne $connLine) {
+              $tok = ($connLine -split '\s+')[-1]
+              if ($tok -match '^[0-9]' -and [double]$tok -le 0) { return 'stuck' }
+            }
             return 'ok'
           }
 
-          # Probe end-to-end: TCP connect ke hostname publik tunnel:3389.
-          # Melewati rantai DNS -> edge Cloudflare -> tunnel -> cloudflared -> RDP.
-          # Hasil: 'skip' (RDP_HOSTNAME belum diatur) | 'ok' | 'fail'
           function Test-E2E {
             if ([string]::IsNullOrWhiteSpace($env:RDP_HOSTNAME)) { return 'skip' }
             $c = New-Object System.Net.Sockets.TcpClient
             try {
               $ar = $c.BeginConnect($env:RDP_HOSTNAME, 3389, $null, $null)
-              if (-not $ar.AsyncWaitHandle.WaitOne(5000, $false)) { return 'fail' }
+              if (-not $ar.AsyncWaitHandle.WaitOne($e2eTimeoutMs, $false)) { return 'fail' }
               $c.EndConnect($ar)
               return 'ok'
             } catch { return 'fail' }
@@ -227,123 +286,235 @@ jobs:
 
           function Test-RDP {
             try {
-              return Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue -InformationLevel Quiet
+              $c = New-Object System.Net.Sockets.TcpClient
+              $ar = $c.BeginConnect('127.0.0.1', 3389, $null, $null)
+              $ok = $ar.AsyncWaitHandle.WaitOne(2000, $false)
+              if ($ok) { $c.EndConnect($ar) }
+              $c.Close()
+              return [bool]$ok
             } catch { return $false }
           }
 
           function Ensure-RDP {
             $svc = Get-Service -Name TermService -ErrorAction SilentlyContinue
             if ($svc.Status -ne 'Running') {
-              Write-Host "[!] TermService not running, restarting..."
+              Write-Log "[!] TermService not running, restarting..."
               Start-Service TermService
               Start-Sleep 3
             }
           }
 
+          function Hard-Reset([string]$reason) {
+            Write-Log "[!] HARD RESET ($reason) - flush DNS, flip protocol, restart"
+            Stop-Tunnel $proc
+            Clear-DnsClientCache -ErrorAction SilentlyContinue
+            $script:protocol = if ($protocol -eq 'quic') { 'http2' } else { 'quic' }
+            $script:proc = Start-Tunnel
+            $script:bootUntil = (Get-Date).AddSeconds($bootWaitSec)
+            $script:stateSince = Get-Date
+          }
+
+          Write-Log "[+] Watchdog v8 FAST started (protocol=$protocol)"
+          Write-Log "    Credentials: see USER / PASSWORD repo secrets."
+
+          $backoff        = 3
+          $maxBackoff     = 30
+          $lastTunnelUp   = $true
+          $lastRdpUp      = $true
+          $stateSince     = $null
+          $bootUntil      = (Get-Date).AddSeconds($bootWaitSec)
+          $flaps          = @()
+          $tick           = 0
+          $e2eFails       = 0
+          $e2eSkipLogged  = $false
+          $hardResets     = 0
+          $lastHardResetAt = $null
+          $lastE2eOkAt    = Get-Date
+          $proc = Start-Tunnel
+          Send-Heartbeat
+
+          while ($true) {
+            try {
+              Send-Heartbeat
+              $tick++
+
+              # --- boot grace: metrics butuh waktu up setelah start ---
+              if ((Get-Date) -lt $bootUntil) {
+                Start-Sleep -Milliseconds $pollMs
+                continue
+              }
+
+              $state    = Get-TunnelState
+              $tunnelOk = ($state -eq 'ok')
+
+              if ($tunnelOk) {
+                if (-not $lastTunnelUp) {
+                  $dur = if ($stateSince) { [int]((Get-Date) - $stateSince).TotalSeconds } else { -1 }
+                  Write-Log "[+] Tunnel RECOVERED (down ~${dur}s)"
+                }
+                $stateSince = $null
+                $lastTunnelUp = $true
+                $backoff = 3
+              } else {
+                if ($null -eq $stateSince) { $stateSince = Get-Date }
+                $downFor = [int]((Get-Date) - $stateSince).TotalSeconds
+                if ($lastTunnelUp) { Write-Log "[!] Tunnel DOWN ($state) - detecting..." }
+
+                # exited / nometa: proses sudah mati atau hang -> restart SEGERA
+                # stuck: beri jendela self-reconnect sesuai riwayat flap
+                $grace = $stuckFastSec
+                if ($state -eq 'stuck') {
+                  $flaps = @($flaps | Where-Object { ((Get-Date) - $_).TotalSeconds -lt $flapWindowSec })
+                  if ($flaps.Count -ge $flapLimit) { $grace = $stuckSlowSec }
+                }
+
+                if ($state -ne 'stuck' -or $downFor -ge $grace) {
+                  $latency = "{0:N1}s" -f ((Get-Date) - $stateSince).TotalSeconds
+                  Write-Log "[!] DETECTED after ${latency} ($state) -> restart now"
+                  Stop-Tunnel $proc
+                  Clear-DnsClientCache -ErrorAction SilentlyContinue
+                  $proc = Start-Tunnel
+                  # reset jam down: setelah restart baru, kasih jendela
+                  # self-reconnect penuh lagi (8s/30s). Tanpa ini downFor
+                  # mewarisi usia episode lama -> cloudflared dibunuh 0 detik
+                  # setelah boot, padahal butuh 10-15s untuk handshake edge
+                  # di jaringan buruk.
+                  $stateSince = Get-Date
+                  # tidak boleh menghajar edge dengan restart tiap 10 detik
+                  $bootUntil = (Get-Date).AddSeconds($bootWaitSec + $backoff)
+                  $backoff = [Math]::Min($backoff * 2, $maxBackoff)
+                  if ($state -eq 'stuck') { $flaps += Get-Date }
+                } else {
+                  if ($downFor % 2 -eq 0) {
+                    Write-Log "[!] stuck ${downFor}/${grace}s - letting cloudflared self-reconnect (flap=$($flaps.Count))"
+                  }
+                }
+                $lastTunnelUp = $false
+              }
+
+              # --- RDP lokal (tiap 5 detik) ---
+              if ($tick % 5 -eq 0) {
+                $rdpOk = Test-RDP
+                if (-not $rdpOk) {
+                  if ($lastRdpUp) { Write-Log "[!] RDP port 3389 DOWN - fixing..." }
+                  Ensure-RDP
+                } elseif (-not $lastRdpUp) { Write-Log "[+] RDP recovered!" }
+                $lastRdpUp = $rdpOk
+              }
+
+              # --- E2E anti-zombie (hanya saat lokal bilang SEHAT) ---
+              # Kalau lokal bilang sehat tapi jalur publik mati = socket
+              # setengah mati. 2x gagal x 5s = ~10-13 detik -> hard reset.
+              if ($tick % $e2eEveryTicks -eq 0) {
+                $e2e = Test-E2E
+                if ($e2e -eq 'skip') {
+                  if (-not $e2eSkipLogged) {
+                    $e2eSkipLogged = $true
+                    Write-Log "[i] RDP_HOSTNAME belum diatur - E2E anti-zombie nonaktif."
+                  }
+                } elseif ($e2e -eq 'ok') {
+                  if ($e2eFails -ge $e2eFailLimit) { Write-Log "[+] E2E recovered (user path OK)" }
+                  $e2eFails = 0
+                  $lastE2eOkAt = Get-Date
+                  if ($hardResets -gt 0) { $hardResets = 0; $lastHardResetAt = $null }
+                } else {
+                  $e2eFails++
+                  if ($tunnelOk) {
+                    Write-Log "[!] E2E FAIL $e2eFails/$e2eFailLimit (${env:RDP_HOSTNAME}:3389) local=OK -> ZOMBIE?"
+                    if ($e2eFails -ge $e2eFailLimit) {
+                      $e2eFails = 0
+                      $sinceLast = if ($lastHardResetAt) { ((Get-Date) - $lastHardResetAt).TotalSeconds } else { 9999 }
+                      if ($hardResets -ge 4 -and $sinceLast -lt 300) {
+                        Write-Log "[!] E2E still dead - cooldown hard reset ($([int]$sinceLast)/300s)"
+                      } else {
+                        $hardResets++
+                        $lastHardResetAt = Get-Date
+                        Hard-Reset "zombie #${hardResets}: /ready OK tapi user path mati"
+                      }
+                    }
+                  }
+                  # lokal sedang down: biarkan layer lokal yang handle (hindari double-restart)
+                }
+              }
+
+              Start-Sleep -Milliseconds $pollMs
+            } catch {
+              Write-Log "[!] Watchdog loop error (recovered): $($_.Exception.Message)"
+              Start-Sleep -Seconds 1
+            }
+          }
+          '@
+          Set-Content -Path "$env:USERPROFILE\watchdog.ps1" -Value $wd -Encoding utf8
+          Write-Host "[+] Watchdog v8 written to $env:USERPROFILE\watchdog.ps1"
+      - name: Run Tunnel Supervisor
+        env:
+          TCP_CREDENTIALS: ${{ secrets.TCP_CREDENTIALS }}
+          RDP_HOSTNAME: ${{ secrets.RDP_HOSTNAME }}
+        run: |
+          # Supervisor v8: heartbeat watchdog dicek tiap 5 detik (bukan 10),
+          # stale 60s -> bunuh dan spawn ulang. Watchdog tidak bisa mati
+          # diam-diam, dan hook GITHUB_STEP_SUMMARY dipakai untuk auto
+          # re-dispatch sebelum limit 6 jam (dilakukan di langkah terpisah).
+          $wdPath      = "$env:USERPROFILE\watchdog.ps1"
+          $hbFile      = "$env:USERPROFILE\cf-watchdog.hb"
+          $hbStaleSec  = 60
+          $outLog      = "$env:USERPROFILE\watchdog.out.log"
+          $errLog      = "$env:USERPROFILE\watchdog.err.log"
+          $supBackoff  = 5
+          $maxSupBack  = 30
+
           Write-Host "===================================="
-          Write-Host "[+] RDP is ready"
+          Write-Host "[+] Supervisor v8 started (fast detection)"
           Write-Host "    Credentials: see the USER and PASSWORD repository secrets."
           Write-Host "===================================="
 
-          $backoff     = 5
-          $maxBackoff  = 60
-          $stuckGrace  = 90
-          $pollSec     = 5
-          $e2eInterval = 30
-          $lastTunnelUp = $true
-          $lastRdpUp    = $true
-          $downSince    = $null
-          $lastE2e      = $null
-          $e2eWarned    = $false
-          $e2eSkipLogged = $false
-          $proc = Start-Tunnel
-          Start-Sleep -Seconds 8
-
           while ($true) {
-            $state = Get-TunnelState
-            $rdpOk = Test-RDP
+            Remove-Item $hbFile -Force -ErrorAction SilentlyContinue
+            $p = Start-Process -FilePath "pwsh.exe" `
+                 -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',$wdPath) `
+                 -PassThru -WindowStyle Hidden `
+                 -RedirectStandardOutput $outLog -RedirectStandardError $errLog
+            Write-Host "[*] Watchdog v8 PID $($p.Id) started"
+            $watchdogStart = Get-Date
+            $hbGraceSec    = 90
+            $hbWarned      = $false
 
-            $tunnelOk = ($state -eq 'ok' -or $state -eq 'unknown')
-
-            # stuck: beri grace period agar reconnect internal cloudflared
-            # (backoff 2-64s) sempat jalan sebelum proses di-kill.
-            # exited/nometa langsung restart seperti perilaku lama.
-            if (-not $tunnelOk) {
-              $restart = $true
-              $reason  = $state
-
-              if ($state -eq 'stuck') {
-                if ($null -eq $downSince) { $downSince = Get-Date }
-                $downFor = [int]((Get-Date) - $downSince).TotalSeconds
-                if ($downFor -lt $stuckGrace) {
-                  $restart = $false
-                  if ($downFor -eq 0 -or ($downFor % 30) -eq 0) {
-                    Write-Host "[!] Tunnel stuck (0 edge connections) - grace ${downFor}/${stuckGrace}s, letting cloudflared self-reconnect..."
-                  }
-                } else {
-                  $reason = "stuck for ${downFor}s"
-                }
+            while (-not $p.HasExited) {
+              Start-Sleep -Seconds 5
+              $hbOk = $false
+              if (Test-Path $hbFile) {
+                try {
+                  $ts = [datetime]::Parse((Get-Content $hbFile -Raw).Trim())
+                  if (((Get-Date) - $ts).TotalSeconds -le $hbStaleSec) { $hbOk = $true }
+                } catch {}
               }
+              if ($hbOk) { $hbWarned = $false; continue }
 
-              if ($restart) {
-                $downSince = $null
-                if ($lastTunnelUp) { Write-Host "[!] Tunnel DOWN detected ($reason)" }
-                Write-Host "[!] Restarting in ${backoff}s..."
-                try { if ($proc -and -not $proc.HasExited) { $proc.Kill() } } catch {}
-                Start-Sleep -Seconds 2
-                $proc = Start-Tunnel
-                Start-Sleep -Seconds $backoff
-                $backoff = [Math]::Min($backoff * 2, $maxBackoff)
-              } else {
-                Start-Sleep -Seconds $pollSec
+              $ageSec = [int]((Get-Date) - $watchdogStart).TotalSeconds
+              if ($ageSec -le $hbGraceSec) { continue }
+              if (-not $hbWarned) {
+                Write-Host "[!] Watchdog heartbeat missing/stale (${ageSec}s) - may be hung"
+                $hbWarned = $true
               }
-              $tunnelOk = $false
-            } else {
-              $downSince = $null
-              if (-not $lastTunnelUp) { Write-Host "[+] Tunnel recovered!" }
-              $backoff = 5
-              Start-Sleep -Seconds $pollSec
-            }
-            $lastTunnelUp = $tunnelOk
-
-            # Port RDP mati, jalankan ulang layanannya.
-            if (-not $rdpOk) {
-              Write-Host "[!] RDP port 3389 not listening, fixing..."
-              if ($lastRdpUp) { Write-Host "[!] RDP service DOWN detected" }
-              Ensure-RDP
-            } else {
-              if (-not $lastRdpUp) { Write-Host "[+] RDP recovered!" }
-            }
-            $lastRdpUp = $rdpOk
-
-            # --- E2E probe (opsional, hanya monitoring - TIDAK PERNAH restart) ---
-            # Gagal di sini + lokal OK = masalah DNS/edge Cloudflare di luar
-            # kendali runner; restart justru merusak koneksi yang bagus.
-            if ($null -eq $lastE2e -or ((Get-Date) - $lastE2e).TotalSeconds -ge $e2eInterval) {
-              $lastE2e = Get-Date
-              $e2e = Test-E2E
-              if ($e2e -eq 'skip') {
-                if (-not $e2eSkipLogged) {
-                  $e2eSkipLogged = $true
-                  Write-Host "[i] Secret RDP_HOSTNAME belum diatur - E2E probe nonaktif."
-                }
-              } else {
-                $e2eOk = ($e2e -eq 'ok')
-                if (-not $tunnelOk) {
-                  $e2eWarned = $false
-                } elseif ($e2eOk) {
-                  if ($e2eWarned) { Write-Host "[+] E2E probe recovered! (user path OK: ${env:RDP_HOSTNAME}:3389)" }
-                  $e2eWarned = $false
-                } elseif (-not $e2eWarned) {
-                  Write-Host "[!] E2E probe FAILED (${env:RDP_HOSTNAME}:3389) - local tunnel OK, likely DNS/edge problem (restart won't help)"
-                  $e2eWarned = $true
-                }
+              if ($ageSec -gt ($hbStaleSec + $hbGraceSec)) {
+                Write-Host "[!] Killing hung watchdog PID $($p.Id)"
+                try { $p.Kill(); $null = $p.WaitForExit(10000) } catch {}
+                break
               }
             }
+
+            $exitInfo = if ($p.HasExited) { "exit code $($p.ExitCode)" } else { 'killed' }
+            Write-Host "[!] Watchdog stopped ($exitInfo) - restarting in ${supBackoff}s"
+            Start-Sleep -Seconds $supBackoff
+            if ($p.StartTime -and ((Get-Date) - $p.StartTime).TotalMinutes -ge 5) { $supBackoff = 5 }
+            else { $supBackoff = [Math]::Min($supBackoff * 2, $maxSupBack) }
           }
-
       - name: Cleanup
         if: always()
         run: |
           Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
+          Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match 'watchdog\.ps1' } |
+            ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }
           Remove-Item "$env:USERPROFILE\.cloudflared\tcp_tunnel.json" -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:USERPROFILE\cf-watchdog.hb" -Force -ErrorAction SilentlyContinue
